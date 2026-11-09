@@ -23,6 +23,7 @@ const argv = yargs.options({
     t: { alias: 'noToastNotification', type: 'boolean', default: false, demandOption: false, describe: 'Disable toast notification' },
     i: { alias: 'timeout', type: 'number', demandOption: false, describe: 'Scale timeout by a factor X' },
     w: { alias: 'videoPwd', type: 'string', default: '', demandOption: false, describe: 'Default video password to use (you will be prompted to input the correct one if it\'s wrong or absent)' },
+    a: { alias: 'archive', type: 'string', demandOption: false, describe: 'Specific archive number(s) to download (e.g. "1 2", "2", or "0" for all)' },
     x: { alias: 'extract', type: 'boolean', default: false, demandOption: false, describe: 'Just extract the links' }
 })
     .help('h')
@@ -524,6 +525,213 @@ async function extractRecmanUrls(videoUrls) {
     return aunicaUrls
 }
 
+function promptArchiveSelection(question, archiveCount) {
+    const readline = require('readline');
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
+
+    return new Promise(function (resolve) {
+        var ask = function () {
+            rl.question(question, function (answer) {
+                const trimmed = answer.trim();
+                // Default or 0 or 'all': select all archives (indices 0 to archiveCount - 1)
+                if (trimmed === "" || trimmed === "0" || trimmed.toLowerCase() === "all") {
+                    rl.close();
+                    const allIndices = Array.from({ length: archiveCount }, (_, i) => i);
+                    resolve(allIndices);
+                    return;
+                }
+
+                // Parse space-separated or comma-separated tokens
+                const tokens = trimmed.split(/[\s,]+/).filter(t => t.length > 0);
+                const selected = [];
+                let valid = true;
+
+                for (const t of tokens) {
+                    const num = parseInt(t, 10);
+                    if (isNaN(num) || num < 1 || num > archiveCount) {
+                        valid = false;
+                        break;
+                    }
+                    const idx = num - 1; // 1-based to 0-based index
+                    if (!selected.includes(idx)) {
+                        selected.push(idx);
+                    }
+                }
+
+                if (valid && selected.length > 0) {
+                    rl.close();
+                    selected.sort((a, b) => a - b);
+                    resolve(selected);
+                } else {
+                    term.red(`\nInvalid selection. Please enter numbers between 1 and ${archiveCount} (separated by space) or 0 for all [default: 0]\n`);
+                    ask();
+                }
+            });
+        };
+        ask();
+    });
+}
+
+async function handleWebeepLoginIfPresent(page) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            if (page.url().includes('login/index.php')) {
+                const xpath_auth = "//a[contains(@href, 'auth')]";
+                await page.waitForXPath(xpath_auth, { timeout: 8000 }).catch(() => null);
+                const buttons = await page.$x(xpath_auth);
+                if (buttons.length > 0) {
+                    await Promise.all([
+                        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 * timeout }).catch(() => {}),
+                        buttons[0].click()
+                    ]);
+                }
+            }
+        } catch (e) {
+            // WeBeep login not needed or already completed
+        }
+    }
+}
+
+async function findRecordingArchives(page) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            await sleep(1000);
+            await page.waitForSelector('body', { timeout: 10000 }).catch(() => {});
+            return await page.evaluate(() => {
+                const anchors = Array.from(document.querySelectorAll('a'));
+                const candidates = [];
+
+                for (const a of anchors) {
+                    const href = (a.href || '').trim();
+                    const text = (a.innerText || a.textContent || '').trim();
+                    const textLower = text.toLowerCase();
+
+                    // Check if link points to a Moodle activity or direct launch
+                    const isActivityLink = href.includes('/mod/url/view.php') || 
+                                           href.includes('aunicalogin.polimi.it/aunicalogin/getservizio.xml') ||
+                                           href.includes('recman');
+
+                    if (!isActivityLink) continue;
+
+                    // Check keyword in link text (case-insensitive)
+                    const hasKeyword = textLower.includes('registrazion') || 
+                                       textLower.includes('recording') || 
+                                       textLower.includes('recman') ||
+                                       textLower.includes('webex');
+
+                    // Or check if this link is located inside a section titled "Registrazioni" / "Recordings"
+                    let inRecordingSection = false;
+                    let parent = a.closest('.section, .course-section, section, div.section-summary, div.content, li.section, div.activity');
+                    if (parent) {
+                        const parentText = (parent.innerText || parent.textContent || '').toLowerCase();
+                        if (parentText.includes('registrazion') || parentText.includes('recording')) {
+                            inRecordingSection = true;
+                        }
+                    }
+
+                    if (hasKeyword || inRecordingSection) {
+                        let title = text.replace(/\s+/g, ' ').trim();
+                        if (!title && parent) {
+                            title = (parent.innerText || parent.textContent || '').replace(/\s+/g, ' ').trim();
+                        }
+                        candidates.push({
+                            title: title || 'Archivio Registrazioni',
+                            href: href
+                        });
+                    }
+                }
+
+                // Deduplicate candidates by href (ignoring hash)
+                const unique = [];
+                const seen = new Set();
+                for (const c of candidates) {
+                    const normHref = c.href.split('#')[0];
+                    if (!seen.has(normHref)) {
+                        seen.add(normHref);
+                        unique.push({
+                            title: c.title,
+                            href: normHref
+                        });
+                    }
+                }
+                return unique;
+            });
+        } catch (err) {
+            if (err.message && err.message.includes('Execution context was destroyed')) {
+                await sleep(2000);
+                await handleWebeepLoginIfPresent(page);
+                continue;
+            }
+            throw err;
+        }
+    }
+    return [];
+}
+
+async function getArchivesFromWebeepCourse(page, courseUrl) {
+    await page.goto(courseUrl, { waitUntil: 'networkidle2' });
+    await sleep(1000);
+    await handleWebeepLoginIfPresent(page);
+
+    // Search for archives on the course page (case-insensitive & section-aware)
+    let archives = await findRecordingArchives(page);
+
+    // If not found and url did not have section, try &section=3 as fallback
+    if (archives.length === 0 && !courseUrl.includes('section=')) {
+        const section3Url = courseUrl + (courseUrl.includes('?') ? '&' : '?') + 'section=3';
+        await page.goto(section3Url, { waitUntil: 'networkidle2' });
+        await sleep(1000);
+        await handleWebeepLoginIfPresent(page);
+        archives = await findRecordingArchives(page);
+    }
+
+    if (!archives || archives.length === 0) {
+        term.red("\nCan't get the RecMan url. Did you submit the correct WeBeep link?\n");
+        return [];
+    }
+
+    if (archives.length === 1) {
+        term.yellow(`\nFound 1 recording archive on WeBeep: ${archives[0].title}\n`);
+        return archives;
+    }
+
+    // Multiple archives found
+    term.yellow(`\nFound ${archives.length} recording archives on WeBeep:\n`);
+    term.cyan(`  [0] Download ALL archives (${archives.length} archives)\n`);
+    for (let i = 0; i < archives.length; i++) {
+        term.cyan(`  [${i + 1}] ${archives[i].title}\n`);
+    }
+
+    let selectedIndices = [];
+    if (argv.archive !== undefined) {
+        const val = String(argv.archive).trim();
+        if (val === "0" || val.toLowerCase() === "all") {
+            selectedIndices = Array.from({ length: archives.length }, (_, i) => i);
+        } else {
+            const tokens = val.split(/[\s,]+/).filter(t => t.length > 0);
+            for (const t of tokens) {
+                const num = parseInt(t, 10);
+                if (!isNaN(num) && num >= 1 && num <= archives.length) {
+                    const idx = num - 1;
+                    if (!selectedIndices.includes(idx)) selectedIndices.push(idx);
+                }
+            }
+        }
+    }
+    if (selectedIndices.length === 0) {
+        selectedIndices = await promptArchiveSelection(
+            `Select archives to download (space-separated, e.g. 1 2, or 0 for all) [default: 0]: `,
+            archives.length
+        );
+    }
+
+    term.yellow(`\nSelected ${selectedIndices.length} archive(s) for download.\n`);
+    return selectedIndices.map(idx => archives[idx]);
+}
+
 async function extractRecordingsUrl(aunicalogin_url) {
     var page;
     const webexUrls = [];
@@ -540,121 +748,169 @@ async function extractRecordingsUrl(aunicalogin_url) {
 
     term.yellow('\nExtracting WebEx recordings from ' + aunicalogin_url + '\nThis could take a while...\n');
 
-    if ((new URL(aunicalogin_url)).host == 'webeep.polimi.it') {
-        aunicalogin_url = await getAunicaUrlFromWebeep(page, aunicalogin_url);
-        if (aunicalogin_url == null) { return webexUrls; }
+    let targetArchives = [];
+    let parsedUrl;
+    try {
+        parsedUrl = new URL(aunicalogin_url);
+    } catch (e) {
+        parsedUrl = null;
     }
 
-    await page.goto(aunicalogin_url, { waitUntil: 'networkidle2' });
+    const isCourseUrl = parsedUrl && parsedUrl.host === 'webeep.polimi.it' && !aunicalogin_url.includes('/mod/url/view.php');
 
-    const recmanTarget = await browser.waitForTarget(target => target.url().includes('recman_frontend'), {
-        timeout: 90000
-    });
-
-    const recmanPage = (await recmanTarget.page()) || page;
-    await recmanPage.bringToFront().catch(() => {});
-    try { await recmanPage.waitForSelector("table, a", { timeout: 15000 }).catch(() => {}); } catch (e) {}
-
-    // Check if there is an action=plen_0 link to display all recordings on a single page
-    try {
-        const plen0 = await recmanPage.evaluate(() => {
-            const a = Array.from(document.querySelectorAll("a")).find(el => el.href && el.href.includes("action=plen_0"));
-            return a ? a.href : null;
-        });
-        if (plen0) {
-            term.cyan("Navigating to show ALL course recordings (plen_0)...\n");
-            await recmanPage.goto(plen0, { waitUntil: "networkidle2" });
-            await recmanPage.waitForSelector("table, a", { timeout: 15000 }).catch(() => {});
+    if (isCourseUrl) {
+        targetArchives = await getArchivesFromWebeepCourse(page, aunicalogin_url);
+        if (!targetArchives || targetArchives.length === 0) {
+            return webexUrls;
         }
-    } catch (e) {}
+    } else {
+        targetArchives = [{
+            title: aunicalogin_url,
+            href: aunicalogin_url
+        }];
+    }
 
-    let previewLinks = await recmanPage.evaluate(() => {
-        let elements = Array.from(document.querySelectorAll("a"));
-        let links = elements.map(el => el.href).filter(h => h && (
-            h.includes("evn_preview_link") || 
-            h.includes("RedirectToWebEx") || 
-            h.includes("webex.com")
-        ));
-        return [...new Set(links)];
-    });
+    for (let aIdx = 0; aIdx < targetArchives.length; aIdx++) {
+        const target = targetArchives[aIdx];
+        if (targetArchives.length > 1) {
+            term.yellow(`\n[Archive ${aIdx + 1}/${targetArchives.length}] Opening ${target.title}...\n`);
+        } else {
+            term.yellow(`\nOpening ${target.title}...\n`);
+        }
+        term.gray(`Target URL: ${target.href}\n`);
 
-    term.green(`Found ${previewLinks.length} preview links on RecMan.\n`);
+        let recmanPage = null;
 
-    for (let i = 0; i < previewLinks.length; i++) {
-        const link = previewLinks[i];
-        if (link.includes("webex.com")) {
-            webexUrls.push(link);
+        // Navigate to the target archive URL
+        await page.goto(target.href, { waitUntil: 'networkidle2' });
+        await sleep(1000);
+        await handleWebeepLoginIfPresent(page);
+
+        // If still on WeBeep (e.g. Moodle didn't auto-redirect), find and navigate to getservizio.xml
+        if (page.url().includes('webeep.polimi.it')) {
+            term.gray(`Still on WeBeep (${page.url()}), checking for launch link...\n`);
+            const launchUrl = await page.evaluate(() => {
+                const contentArea = document.getElementById('page-content') || 
+                                    document.getElementById('region-main') || 
+                                    document.querySelector('.urlworkaround, main, [role="main"]') || 
+                                    document.body;
+                const anchors = Array.from(contentArea.querySelectorAll('a'));
+
+                const recman2294 = anchors.find(a => a.href && a.href.includes('getservizio.xml') && a.href.includes('id_servizio=2294'));
+                if (recman2294) return recman2294.href;
+
+                const classeAnchor = anchors.find(a => a.href && a.href.includes('getservizio.xml') && a.href.includes('c_classe_webeep'));
+                if (classeAnchor) return classeAnchor.href;
+
+                const otherAunica = anchors.find(a => a.href && a.href.includes('getservizio.xml') && !a.href.includes('id_servizio=2292'));
+                if (otherAunica) return otherAunica.href;
+
+                const fallback = anchors.find(a => a.href && a.href.includes('aunicalogin.polimi.it/aunicalogin/getservizio.xml'));
+                return fallback ? fallback.href : null;
+            });
+
+            if (launchUrl) {
+                await page.goto(launchUrl, { waitUntil: 'networkidle2' });
+            }
+        }
+
+        recmanPage = page;
+        if (!page.url().includes('recman_frontend')) {
+            const recmanTarget = await browser.waitForTarget(
+                t => t.url().includes('recman_frontend'),
+                { timeout: 30000 }
+            ).catch(() => null);
+            if (recmanTarget) {
+                recmanPage = (await recmanTarget.page()) || page;
+            }
+        }
+
+        // Wait for RecMan to complete navigation/redirection
+        if (!recmanPage.url().includes('recman_frontend')) {
+            await recmanPage.waitForFunction(
+                () => window.location.href.includes('recman_frontend') || window.location.href.includes('Brain.do'),
+                { timeout: 30000 }
+            ).catch(() => null);
+        }
+
+        if (recmanPage.url().includes('Brain.do') || recmanPage.url().includes('configuratorefaq')) {
+            const pageText = await recmanPage.evaluate(() => document.body.innerText).catch(() => 'Unable to read body');
+            term.red(`\n================== [POLIMI ERROR DETAILS] ==================\n`);
+            term.red(`URL: ${recmanPage.url()}\n`);
+            term.red(`Page text:\n${pageText.trim()}\n`);
+            term.red(`============================================================\n`);
+            if (recmanPage !== page) {
+                await recmanPage.close().catch(() => {});
+            }
             continue;
         }
-        let tab = null;
+
+        await recmanPage.bringToFront().catch(() => {});
+        try { await recmanPage.waitForSelector("table, a", { timeout: 15000 }).catch(() => {}); } catch (e) {}
+
+        // Check if there is an action=plen_0 link to display all recordings on a single page
         try {
-            tab = await browser.newPage();
-            await tab.goto(link, { waitUntil: "domcontentloaded", timeout: 30000 });
-            await tab.waitForFunction(() => window.location.href.includes("webex.com"), { timeout: 8000 }).catch(() => {});
-            const finalUrl = tab.url();
-            if (finalUrl.includes("webex.com")) {
-                term.gray(`[${i + 1}/${previewLinks.length}] Resolved: ${finalUrl}\n`);
-                webexUrls.push(finalUrl);
-            } else {
-                const html = await tab.content();
-                const m = html.match(/https:\/\/[^"'\s<>]*webex\.com\/[^"'\s<>]*/);
-                if (m) {
-                    term.gray(`[${i + 1}/${previewLinks.length}] Extracted: ${m[0]}\n`);
-                    webexUrls.push(m[0]);
+            const plen0 = await recmanPage.evaluate(() => {
+                const a = Array.from(document.querySelectorAll("a")).find(el => el.href && el.href.includes("action=plen_0"));
+                return a ? a.href : null;
+            });
+            if (plen0) {
+                term.cyan("Navigating to show ALL course recordings (plen_0)...\n");
+                await recmanPage.goto(plen0, { waitUntil: "networkidle2" });
+                await recmanPage.waitForSelector("table, a", { timeout: 15000 }).catch(() => {});
+            }
+        } catch (e) {}
+
+        let previewLinks = await recmanPage.evaluate(() => {
+            let elements = Array.from(document.querySelectorAll("a"));
+            let links = elements.map(el => el.href).filter(h => h && (
+                h.includes("evn_preview_link") || 
+                h.includes("RedirectToWebEx") || 
+                h.includes("webex.com")
+            ));
+            return [...new Set(links)];
+        });
+
+        term.green(`Found ${previewLinks.length} preview links on RecMan for: ${target.title}\n`);
+
+        for (let i = 0; i < previewLinks.length; i++) {
+            const link = previewLinks[i];
+            if (link.includes("webex.com")) {
+                webexUrls.push(link);
+                continue;
+            }
+            let tab = null;
+            try {
+                tab = await browser.newPage();
+                await tab.goto(link, { waitUntil: "domcontentloaded", timeout: 30000 });
+                await tab.waitForFunction(() => window.location.href.includes("webex.com"), { timeout: 8000 }).catch(() => {});
+                const finalUrl = tab.url();
+                if (finalUrl.includes("webex.com")) {
+                    term.gray(`[${i + 1}/${previewLinks.length}] Resolved: ${finalUrl}\n`);
+                    webexUrls.push(finalUrl);
                 } else {
-                    term.yellow(`[${i + 1}/${previewLinks.length}] Warning: could not resolve WebEx URL from preview link.\n`);
+                    const html = await tab.content();
+                    const m = html.match(/https:\/\/[^"'\s<>]*webex\.com\/[^"'\s<>]*/);
+                    if (m) {
+                        term.gray(`[${i + 1}/${previewLinks.length}] Extracted: ${m[0]}\n`);
+                        webexUrls.push(m[0]);
+                    } else {
+                        term.yellow(`[${i + 1}/${previewLinks.length}] Warning: could not resolve WebEx URL from preview link.\n`);
+                    }
+                }
+            } catch (e) {
+                term.red(`[${i + 1}/${previewLinks.length}] Failed resolving link: ${e.message}\n`);
+            } finally {
+                if (tab) {
+                    await tab.close().catch(() => {});
                 }
             }
-        } catch (e) {
-            term.red(`[${i + 1}/${previewLinks.length}] Failed resolving link: ${e.message}\n`);
-        } finally {
-            if (tab) {
-                await tab.close().catch(() => {});
-            }
         }
+
+
     }
 
-    return webexUrls;
-}
-
-
-async function getAunicaUrlFromWebeep(page, aunicalogin_url) {
-    aunicalogin_url += '&section=3' // add this parameter --> parameter to directly go the the Recordings page
-    await page.goto(aunicalogin_url, { waitUntil: 'networkidle2' });
-    try {
-        await browser.waitForTarget(target => target.url().includes('login/index.php'), {
-            timeout: 1000 * timeout
-        });
-        const xpath_expr = "//a[contains(@href, 'auth')]"
-        await page.waitForXPath(xpath_expr);
-        const button = (await page.$x(xpath_expr))[0]; // get anchors where href contains "auth" --> login button
-        await button.evaluate(b => b.click()); // clicca sul tasto "Polimi login"
-
-    } catch (error) {
-        // WeBeep login not needed, already logged
-    }
-
-    try { await page.waitForNavigation({ timeout: 2000 * timeout }) } catch (e) { };
-    await page.waitForNavigation();
-
-    //const xpath_expr = "//a[contains(@href, '/mod/url/view.php')]"
-    const xpath_expr = "//a[contains(., 'Archivio registrazioni') or contains(., 'Recordings archive')]"
-    try {
-        await page.waitForXPath(xpath_expr, { timeout: 3000 * timeout });
-    } catch (e) {
-        term.red("\nCan't get the RecMan url. Did you submit the correct WeBeep link?\n")
-        return null
-    }
-    const anchor = (await page.$x(xpath_expr))[0];
-    const href = await page.evaluate(a => a.getAttribute('href'), anchor)
-    await page.goto(href, { waitUntil: 'networkidle2' });
-    let aunicaurl = await page.evaluate(() => {
-        let elements = document.getElementById('page-content').getElementsByTagName('a');
-        const urlArray = Array.from(elements).map((link) => link.href);
-        return urlArray.find((link) => link.includes("aunicalogin.polimi.it/aunicalogin/getservizio.xml"))
-    });
-
-    return aunicaurl;
+    return [...new Set(webexUrls)];
 }
 
 async function getCookies(password) {
