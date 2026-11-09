@@ -253,35 +253,37 @@ async function downloadVideo(videoUrls, password, outputDirectory, videoPwd) {
             // console.log("no upload date found");
         }
 
-        const recordingDir = obj.mp4StreamOption.recordingDir
-        const timestamp = obj.mp4StreamOption.timestamp
-        const token = obj.mp4StreamOption.token
-        const html5ApiUrl = 'https://nfg1vss.webex.com/apis/html5-pipeline.do?recordingDir=' + recordingDir + '&timestamp=' + timestamp + '&token=' + token + '&xmlName=recording.xml'
-
         var newAPI = false;
-        try {
-            var options = {
-                url: html5ApiUrl,
-            };
-            var xmlResponse = await doRequest(options);
-        } catch (e) {
-            if ("mp4URL" in obj.downloadRecordingInfo.downloadInfo || "fallbackPlaySrc" in obj) {
-                term.yellow('\nUsing new API version');
+        var recordingDir, timestamp, token, filename = "";
+
+        if (obj.mp4StreamOption) {
+            recordingDir = obj.mp4StreamOption.recordingDir;
+            timestamp = obj.mp4StreamOption.timestamp;
+            token = obj.mp4StreamOption.token;
+            const html5ApiUrl = 'https://nfg1vss.webex.com/apis/html5-pipeline.do?recordingDir=' + recordingDir + '&timestamp=' + timestamp + '&token=' + token + '&xmlName=recording.xml';
+            try {
+                var options = {
+                    url: html5ApiUrl,
+                };
+                var xmlResponse = await doRequest(options);
+                const jsonObj = await xmlToJSON(xmlResponse, {});
+                filename = jsonObj.HTML5Pipeline.RecordingXML[0].Screen[0].Sequence[0]._;
+                if (!filename.endsWith(".mp4")) {
+                    throw new Error("Invalid filename in XML");
+                }
+            } catch (e) {
                 newAPI = true;
+            }
+        } else {
+            newAPI = true;
+        }
+
+        if (newAPI) {
+            const hasMp4Url = obj.downloadRecordingInfo && obj.downloadRecordingInfo.downloadInfo && "mp4URL" in obj.downloadRecordingInfo.downloadInfo;
+            if (hasMp4Url || "fallbackPlaySrc" in obj) {
+                term.yellow('\nUsing new API version');
             } else {
                 term.red('\nCan\'t get current video XML-URL. Going to the next one.\n');
-                notDownloaded.push(videoUrl);
-                continue;
-            }
-
-        }
-        var filename = "";
-        if (!newAPI) {
-            const jsonObj = await xmlToJSON(xmlResponse, {})
-            filename = jsonObj.HTML5Pipeline.RecordingXML[0].Screen[0].Sequence[0]._; // maybe there could be more resolutions here?
-
-            if (!filename.endsWith(".mp4")) {
-                term.red('\nCan\'t parse XML correctly. Going to the next one.\n');
                 notDownloaded.push(videoUrl);
                 continue;
             }
@@ -289,7 +291,7 @@ async function downloadVideo(videoUrls, password, outputDirectory, videoPwd) {
 
         var mp4DirectDownloadUrl_slow;
         if (newAPI) {
-            if ("mp4URL" in obj.downloadRecordingInfo.downloadInfo)
+            if (obj.downloadRecordingInfo && obj.downloadRecordingInfo.downloadInfo && "mp4URL" in obj.downloadRecordingInfo.downloadInfo)
                 mp4DirectDownloadUrl_slow = obj.downloadRecordingInfo.downloadInfo.mp4URL;
             else
                 mp4DirectDownloadUrl_slow = obj.fallbackPlaySrc;
